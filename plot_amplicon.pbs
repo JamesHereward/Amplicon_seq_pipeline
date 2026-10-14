@@ -1,0 +1,16 @@
+#!/bin/bash
+#PBS -N plot_ampliconNATNAT3
+#PBS -l walltime=2:00:00
+#PBS -l mem=64gb
+#PBS -l ncpus=8
+#PBS -j oe
+#PBS -o /mnt/lustre/working/lab_leonh/jamesHe/NATNAT/relaxed/logs/plot_ampliconNATNAT3.log
+
+set -euo pipefail
+
+cd /mnt/lustre/working/lab_leonh/jamesHe/NATNAT/relaxed/
+module load python/3.11.4
+source ~/.proxy
+
+python3 plot_pipeline_summary.py -b /mnt/lustre/working/lab_leonh/jamesHe/NATNAT/relaxed -m /mnt/lustre/working/lab_leonh/jamesHe/NATNAT/metadata.csv
+

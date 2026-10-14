@@ -1,0 +1,346 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Amplicon Pipeline Guide</title>
+
+<style>
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, sans-serif;
+         max-width: 960px; margin: 40px auto; padding: 0 24px;
+         color: #222; line-height: 1.6; font-size: 15px; }
+  h1 { font-size: 2em; border-bottom: 2px solid #2c6fad; padding-bottom: 8px; color: #1a1a2e; }
+  h2 { font-size: 1.4em; border-bottom: 1px solid #ddd; padding-bottom: 4px;
+       margin-top: 2em; color: #2c6fad; }
+  h3 { font-size: 1.15em; color: #333; margin-top: 1.5em; }
+  code { background: #f4f4f4; border-radius: 3px; padding: 2px 5px;
+         font-family: "SFMono-Regular", Consolas, monospace; font-size: 0.88em; }
+  pre  { background: #f6f8fa; border: 1px solid #e1e4e8; border-radius: 6px;
+         padding: 14px 16px; overflow-x: auto; }
+  pre code { background: none; padding: 0; font-size: 0.85em; }
+  table { border-collapse: collapse; width: 100%; margin: 1em 0; font-size: 0.93em; }
+  th { background: #2c6fad; color: white; padding: 8px 12px; text-align: left; }
+  td { border: 1px solid #ddd; padding: 7px 12px; }
+  tr:nth-child(even) td { background: #f9f9f9; }
+  blockquote { border-left: 4px solid #2c6fad; margin: 0; padding: 8px 16px;
+               background: #f0f6ff; color: #444; }
+  hr { border: none; border-top: 1px solid #ddd; margin: 2em 0; }
+  a  { color: #2c6fad; }
+</style>
+
+</head><body>
+<h1 id="amplicon-pipeline-user-guide">Amplicon Pipeline — User Guide</h1>
+<h2 id="overview">Overview</h2>
+<p>This pipeline processes paired-end Illumina amplicon sequencing data through three stages:</p>
+<ol>
+<li><strong>cutadapt</strong> — primer trimming and removal of reads without primers</li>
+<li><strong>bbduk</strong> — adapter trimming and quality filtering</li>
+<li><strong>bbmerge</strong> — merging of overlapping read pairs into single amplicon sequences</li>
+</ol>
+<p>One PBS job is submitted per locus, so COI and ITS2 (for example) run simultaneously
+as separate jobs. All samples for a given locus are processed sequentially within that job.</p>
+<hr />
+<h2 id="files">Files</h2>
+<table>
+<thead>
+<tr>
+<th>File</th>
+<th>Purpose</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>submit_amplicon_pipeline.sh</code></td>
+<td>Master submission script — reads <code>primers.txt</code> and submits one PBS job per locus</td>
+</tr>
+<tr>
+<td><code>amplicon_pipeline.pbs</code></td>
+<td>PBS job script — runs cutadapt → bbduk → bbmerge for one locus</td>
+</tr>
+<tr>
+<td><code>primers.txt</code></td>
+<td>Locus definitions (primer names and sequences)</td>
+</tr>
+<tr>
+<td><code>sequences.txt</code></td>
+<td>List of sample filenames from the sequencer</td>
+</tr>
+</tbody>
+</table>
+<p>Both scripts must be in the same directory. Do not run <code>amplicon_pipeline.pbs</code> directly —
+always submit via <code>submit_amplicon_pipeline.sh</code>.</p>
+<hr />
+<h2 id="input-file-formats">Input File Formats</h2>
+<h3 id="primerstxt">primers.txt</h3>
+<p>One locus per line, whitespace-delimited. Lines beginning with <code>#</code> are ignored.</p>
+<pre><code># locus_name   fwd_name      fwd_sequence              rev_name      rev_sequence
+COI             mlCOIintF     GGWACWGGWTGAACWGTWTAYCCYCC  jgHCO2198   TAIACYTCIGGRTGICCRAARAAYCA
+ITS2_Plant      ITS-S2F       ATGCGATACTTGGTGTGAAT          ITS4        TCCTCCGCTTATTGATATGC
+</code></pre>
+<p>Degenerate IUPAC bases (R, Y, W, S, K, M, B, D, H, V, N, I) are detected automatically
+and cutadapt is run with <code>--match-read-wildcards</code> for those loci.</p>
+<h3 id="sequencestxt">sequences.txt</h3>
+<p>A plain text file with one filename per line — typically the R1 filenames from the
+sequencer, though any read filename will work. The pipeline strips the read suffix
+automatically, so either R1 or R2 filenames (or a mix) are fine.</p>
+<pre><code>Sample001_R1_001.fastq.gz
+Sample002_R1_001.fastq.gz
+Sample003_R1_001.fastq.gz
+</code></pre>
+<p>The pipeline supports all common Illumina naming conventions:</p>
+<table>
+<thead>
+<tr>
+<th>Pattern</th>
+<th>Example</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Illumina BCL2FASTQ default</td>
+<td><code>Sample001_R1_001.fastq.gz</code></td>
+</tr>
+<tr>
+<td>Simple R1/R2</td>
+<td><code>Sample001_R1.fastq.gz</code></td>
+</tr>
+<tr>
+<td>Numeric 1/2</td>
+<td><code>Sample001_1.fastq.gz</code></td>
+</tr>
+<tr>
+<td>fq.gz extension</td>
+<td><code>Sample001_R1.fq.gz</code></td>
+</tr>
+<tr>
+<td>BCL2FASTQ with fq.gz</td>
+<td><code>Sample001_R1_001.fq.gz</code></td>
+</tr>
+</tbody>
+</table>
+<p>The naming convention is auto-detected from the files present in the input directory —
+you do not need to specify it.</p>
+<hr />
+<h2 id="directory-structure">Directory Structure</h2>
+<p>Set up your project directory as follows before running:</p>
+<pre><code>/path/to/project/
+├── primers.txt
+├── sequences.txt
+├── submit_amplicon_pipeline.sh
+├── amplicon_pipeline.pbs
+└── raw/                        ← raw reads go here (or specify with -i)
+    ├── Sample001_R1_001.fastq.gz
+    ├── Sample001_R2_001.fastq.gz
+    ├── Sample002_R1_001.fastq.gz
+    └── Sample002_R2_001.fastq.gz
+</code></pre>
+<hr />
+<h2 id="running-the-pipeline">Running the Pipeline</h2>
+<h3 id="basic-usage-reads-in-base_pathraw">Basic usage (reads in <code>&lt;base_path&gt;/raw/</code>)</h3>
+<pre><code class="language-bash">cd /path/to/project
+bash submit_amplicon_pipeline.sh -b /path/to/project
+</code></pre>
+<h3 id="specifying-a-different-raw-reads-directory">Specifying a different raw reads directory</h3>
+<pre><code class="language-bash">bash submit_amplicon_pipeline.sh \
+    -b /path/to/project \
+    -i /path/to/raw_reads
+</code></pre>
+<h3 id="full-options">Full options</h3>
+<pre><code class="language-bash">bash submit_amplicon_pipeline.sh \
+    -b /path/to/project \        # output root directory
+    -i /path/to/raw_reads \      # raw reads directory [default: &lt;base_path&gt;/raw]
+    -s /path/to/sequences.txt \  # sample list         [default: ./sequences.txt]
+    -p /path/to/primers.txt \    # primer definitions  [default: ./primers.txt]
+    -w 24:00:00 \                # walltime            [default: 24:00:00]
+    -m 32gb \                    # memory per job      [default: 32gb]
+    -n 40                        # CPUs per job        [default: 40]
+</code></pre>
+<h3 id="monitor-running-jobs">Monitor running jobs</h3>
+<pre><code class="language-bash">qstat -u $USER
+</code></pre>
+<hr />
+<h2 id="outputs">Outputs</h2>
+<p>All outputs are written under <code>&lt;base_path&gt;/</code>. One set of directories is created per locus.</p>
+<pre><code>&lt;base_path&gt;/
+├── logs/
+│   ├── amplicon_COI.log                 ← main PBS job log per locus
+│   ├── cutadapt_COI_Sample001.log       ← per-tool per-sample logs
+│   ├── bbduk_COI_Sample001.log
+│   └── bbmerge_COI_Sample001.log
+│
+├── commands/
+│   ├── cutadapt_COI.cmds               ← exact commands run (for reproducibility)
+│   ├── bbduk_COI.cmds
+│   └── bbmerge_COI.cmds
+│
+├── COI_cutadapt/                        ← primer-trimmed reads
+│   ├── Sample001_R1.fq.gz
+│   └── Sample001_R2.fq.gz
+│
+├── COI_bbduk/                           ← adapter-trimmed, quality-filtered reads
+│   ├── Sample001_R1.fq.gz
+│   └── Sample001_R2.fq.gz
+│
+├── COI_merged/                          ← merged amplicon reads (DADA2 input)
+│   ├── Sample001_merged.fq.gz
+│   ├── Sample001_unmerged_R1.fq.gz
+│   └── Sample001_unmerged_R2.fq.gz
+│
+├── COI_merge_hist/                      ← insert size histograms
+│   └── Sample001.hist
+│
+├── cutadapt_COI_summary.tsv            ← summary table: reads in/out per sample
+├── bbduk_COI_summary.tsv
+└── bbmerge_COI_summary.tsv
+</code></pre>
+<h3 id="summary-tsv-format">Summary TSV format</h3>
+<p>Each stage produces a TSV summarising read counts:</p>
+<p><strong>cutadapt_\&lt;locus&gt;_summary.tsv</strong></p>
+<pre><code>Sample          Input_Pairs  Pairs_Written  Pct_Written
+Sample001       1500000      1234567        82.3
+</code></pre>
+<p><strong>bbduk_\&lt;locus&gt;_summary.tsv</strong></p>
+<pre><code>Sample          Input_Reads  Result_Reads  Pct_Remaining
+Sample001       2469134      2401022       97.2
+</code></pre>
+<p><strong>bbmerge_\&lt;locus&gt;_summary.tsv</strong></p>
+<pre><code>Sample          Pairs    Joined   Pct_Joined
+Sample001       1200511  1156823  96.4
+</code></pre>
+<hr />
+<h2 id="resource-tuning">Resource Tuning</h2>
+<h3 id="memory">Memory</h3>
+<p>The default <code>32gb</code> is sufficient for most amplicon datasets. If bbmerge exits with an
+out-of-memory error, increase to <code>64gb</code>:</p>
+<pre><code class="language-bash">bash submit_amplicon_pipeline.sh -b /path/to/project -m 64gb
+</code></pre>
+<h3 id="cpus">CPUs</h3>
+<p>The default <code>40</code> CPUs matches the thread count used by cutadapt, bbduk and bbmerge
+internally. Adjust to match your HPC queue limits:</p>
+<pre><code class="language-bash">bash submit_amplicon_pipeline.sh -b /path/to/project -n 16
+</code></pre>
+<p>Note: if you change CPUs here you may also need to update <code>THREADS=40</code> inside
+<code>amplicon_pipeline.pbs</code> to match, or the tools will request more threads than
+the job was allocated.</p>
+<h3 id="walltime">Walltime</h3>
+<p>For a typical run of ~384 samples across two loci, <code>24:00:00</code> is usually sufficient.
+Very large datasets (&gt;1000 samples) may need <code>48:00:00</code>.</p>
+<hr />
+<h2 id="troubleshooting">Troubleshooting</h2>
+<h3 id="job-fails-immediately-with-cutadapt-not-found">Job fails immediately with "cutadapt not found"</h3>
+<p>The PBS script loads <code>module load python/3.11.4</code> which should include cutadapt.
+Check that it is installed in that module:</p>
+<pre><code class="language-bash">module load python/3.11.4
+cutadapt --version
+</code></pre>
+<h3 id="read-files-not-found">Read files not found</h3>
+<p>The submit script auto-detects the file naming convention by scanning the input
+directory. If it cannot detect a pattern it will exit with an error listing what
+it looked for. Check that your filenames match one of the supported patterns and
+that <code>-i</code> points to the correct directory.</p>
+<h3 id="bbmerge-low-merge-rate">bbmerge low merge rate</h3>
+<p>A merge rate below ~70% usually means the amplicon is too long for the read length,
+so the reads do not overlap sufficiently. Check that your expected amplicon length
+is less than <code>2 × read_length − 20 bp</code>. For ITS2 (~300–400 bp) with 250 bp reads
+this is at the limit — consider using the unmerged reads as well.</p>
+<h3 id="samples-with-0-reads-after-cutadapt">Samples with 0 reads after cutadapt</h3>
+<p>This means the primer sequences were not found in those reads. Check:
+- The forward and reverse primer sequences are correct and in 5'→3' orientation
+- The locus is actually present in those samples
+- If primers are degenerate, <code>WILDCARD=1</code> should appear in the job log</p>
+<hr />
+<h2 id="post-pipeline-plotting-and-qc-plot_pipeline_summarypy">Post-pipeline: Plotting and QC (<code>plot_pipeline_summary.py</code>)</h2>
+<p>After all PBS jobs have finished, run <code>plot_pipeline_summary.py</code> to combine the
+per-locus TSV summaries and generate QC plots. This script works with output from
+both the PBS pipeline and the Python pipeline.</p>
+<h3 id="requirements">Requirements</h3>
+<pre><code class="language-bash">pip install matplotlib numpy pandas
+# or on the HPC:
+module load python/3.11.4
+</code></pre>
+<h3 id="usage">Usage</h3>
+<pre><code class="language-bash"># Minimal — primers.txt auto-detected from base_path
+python3 plot_pipeline_summary.py -b /path/to/project
+
+# With explicit primers.txt
+python3 plot_pipeline_summary.py \
+    -b /path/to/project \
+    -p /path/to/primers.txt
+</code></pre>
+<h3 id="tsv-discovery">TSV discovery</h3>
+<p>The script tries to find summary data in this order:</p>
+<ol>
+<li><strong>Combined TSV</strong> (written by the Python pipeline):
+   <code>&lt;base_path&gt;/cutadapt_summary.tsv</code> etc.</li>
+<li><strong>Per-locus TSVs</strong> (written by the PBS pipeline):
+   <code>&lt;base_path&gt;/cutadapt_&lt;LOCUS&gt;_summary.tsv</code> etc.</li>
+</ol>
+<p>If per-locus files are used they are merged and written out as combined TSVs,
+so the script runs faster on any subsequent reruns.</p>
+<h3 id="outputs_1">Outputs</h3>
+<p>All plots are written to <code>&lt;base_path&gt;/</code>:</p>
+<table>
+<thead>
+<tr>
+<th>File</th>
+<th>Contents</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>pipeline_summary.png</code></td>
+<td>Overview of reads surviving each stage per sample per locus</td>
+</tr>
+<tr>
+<td><code>cutadapt_summary.png</code></td>
+<td>Reads written vs discarded by cutadapt per locus</td>
+</tr>
+<tr>
+<td><code>bbduk_bbmerge_summary.png</code></td>
+<td>bbduk retention and bbmerge merge rate per locus</td>
+</tr>
+<tr>
+<td><code>&lt;locus&gt;_merge_hist/combined_histogram.tsv</code></td>
+<td>Combined insert-size counts across all samples</td>
+</tr>
+<tr>
+<td><code>&lt;locus&gt;_merge_hist/combined_histogram.png</code></td>
+<td>Insert-size histogram with mean, median and mode</td>
+</tr>
+</tbody>
+</table>
+<p>The insert-size histogram shows the distribution of merged amplicon lengths across
+all samples. The mean, median and mode are shown as dashed lines. A tight peak at
+the expected amplicon length (e.g. ~313 bp for COI minibarcode, ~300 bp for ITS2)
+indicates good primer specificity. A broad distribution or secondary peaks suggest
+off-target amplification or primer dimer.</p>
+<h3 id="typical-workflow">Typical workflow</h3>
+<pre><code class="language-bash"># 1. Submit pipeline jobs
+bash submit_amplicon_pipeline.sh -b /path/to/project
+
+# 2. Wait for jobs to finish
+qstat -u $USER
+
+# 3. Generate QC plots
+module load python/3.11.4
+python3 plot_pipeline_summary.py -b /path/to/project
+
+# 4. Review outputs
+ls /path/to/project/*.png
+ls /path/to/project/*_merge_hist/combined_histogram.png
+</code></pre>
+<p>The merged reads in <code>&lt;locus&gt;_merged/</code> are ready for DADA2 or vsearch amplicon
+processing. Feed the <code>&lt;base_path&gt;</code> and locus name into the downstream pipeline:</p>
+<pre><code class="language-bash"># DADA2 pipeline
+Rscript DADA_HPC.R \
+    --mode   full \
+    -b       /path/to/project \
+    -l       COI \
+    --threads 16
+
+# vsearch pipeline
+python3 vsearch_HPC.py \
+    --mode   full \
+    -b       /path/to/project \
+    -l       COI \
+    --threads 16
+</code></pre>
+</body></html>

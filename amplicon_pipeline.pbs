@@ -1,0 +1,331 @@
+#!/bin/bash
+#PBS -N amplicon_pipeline
+#PBS -l walltime=24:00:00
+#PBS -l mem=32gb
+#PBS -l ncpus=40
+#PBS -j oe
+#PBS -o LOGPATH_PLACEHOLDER
+
+# =============================================================================
+# amplicon_pipeline.pbs
+# ---------------------
+# Runs cutadapt → bbduk → bbmerge for ONE locus across all samples.
+# Submit via submit_amplicon_pipeline.sh (which fills in all variables).
+#
+# Required PBS variables (passed with -v on qsub):
+#   BASE_PATH      root output directory
+#   LOCUS          locus name, e.g. COI or ITS2_Plant
+#   FWD_SEQ        forward primer sequence
+#   REV_SEQ        reverse primer sequence
+#   WILDCARD       1 if primers contain degenerate bases, 0 otherwise
+#   IN_PATH        directory containing raw read files
+#   SEQ_FILE       path to sequences.txt
+#   READ_FMT_R1    R1 file suffix, e.g. _R1_001.fastq.gz
+#   READ_FMT_R2    R2 file suffix, e.g. _R2_001.fastq.gz
+#   READ_EXT       file extension only, e.g. .fastq.gz
+#   CA_ERROR_RATE  cutadapt -e value (default 0.1 if not passed)
+#   CA_OVERLAP     cutadapt --overlap in bp (default 3 if not passed)
+# =============================================================================
+
+set -euo pipefail
+
+# Backward-compatible defaults — old qsub calls without these vars still work
+CA_ERROR_RATE="${CA_ERROR_RATE:-0.1}"
+CA_OVERLAP="${CA_OVERLAP:-3}"
+READ_FMT_R1="${READ_FMT_R1:-_R1.fq.gz}"
+READ_FMT_R2="${READ_FMT_R2:-_R2.fq.gz}"
+
+echo "[$(date)] Starting amplicon pipeline — locus: ${LOCUS}"
+echo "  BASE_PATH      : ${BASE_PATH}"
+echo "  IN_PATH        : ${IN_PATH}"
+echo "  SEQ_FILE       : ${SEQ_FILE}"
+echo "  FWD_SEQ        : ${FWD_SEQ}"
+echo "  REV_SEQ        : ${REV_SEQ}"
+echo "  WILDCARD       : ${WILDCARD}"
+echo "  READ_FMT_R1    : ${READ_FMT_R1}"
+echo "  READ_FMT_R2    : ${READ_FMT_R2}"
+echo "  CA_ERROR_RATE  : ${CA_ERROR_RATE}"
+echo "  CA_OVERLAP     : ${CA_OVERLAP} bp"
+
+# ---------------------------------------------------------------------------
+# Tool paths
+# ---------------------------------------------------------------------------
+BBMAP_DIR=/mnt/backedup/home/jamesHe/bbmap
+THREADS=40
+
+# ---------------------------------------------------------------------------
+# Load cutadapt
+# ---------------------------------------------------------------------------
+module load python/3.11.4
+if ! command -v cutadapt &>/dev/null; then
+    echo "ERROR: cutadapt not found after module load" >&2
+    exit 1
+fi
+echo "  cutadapt  : $(cutadapt --version)"
+echo "  bbmap dir : ${BBMAP_DIR}"
+
+# ---------------------------------------------------------------------------
+# Helper: reverse complement (full IUPAC including inosine I)
+# ---------------------------------------------------------------------------
+rc() {
+    echo "$1" \
+      | tr 'ACGTRYSWKMBDHVNIacgtryswkmbdhvni' \
+            'TGCAYRSWMKVHDBNItgcayrswmkvhdbni' \
+      | rev
+}
+
+# ---------------------------------------------------------------------------
+# Helper: count read pairs in a gzipped fastq (lines/4, using index if present)
+# Returns 0 if file is missing or empty.
+# ---------------------------------------------------------------------------
+count_pairs() {
+    local f="$1"
+    [[ ! -s "$f" ]] && { echo 0; return; }
+    # zcat | wc is reliable; awk avoids integer overflow on large files
+    zcat "$f" 2>/dev/null | awk 'END{print int(NR/4)}' || echo 0
+}
+
+# ---------------------------------------------------------------------------
+# Parse sequences.txt → array of sample base-names
+# ---------------------------------------------------------------------------
+declare -a SAMPLES=()
+while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ -z "$line" ]] && continue
+    name="$line"
+    for suf in \
+        "_R1_001.fastq.gz" "_R2_001.fastq.gz" \
+        "_R1.fastq.gz"     "_R2.fastq.gz" \
+        "_1.fastq.gz"      "_2.fastq.gz" \
+        "_R1_001.fq.gz"    "_R2_001.fq.gz" \
+        "_R1.fq.gz"        "_R2.fq.gz" \
+        "_1.fq.gz"         "_2.fq.gz" \
+        ".R1.clean.fq.gz"  ".R2.clean.fq.gz"; do
+        if [[ "$name" == *"$suf" ]]; then
+            name="${name%$suf}"
+            break
+        fi
+    done
+    SAMPLES+=("$name")
+done < "${SEQ_FILE}"
+
+declare -a UNIQ_SAMPLES=()
+declare -A SEEN=()
+for s in "${SAMPLES[@]}"; do
+    if [[ -z "${SEEN[$s]+x}" ]]; then
+        UNIQ_SAMPLES+=("$s")
+        SEEN[$s]=1
+    fi
+done
+SAMPLES=("${UNIQ_SAMPLES[@]}")
+echo "  Samples   : ${#SAMPLES[@]}"
+
+# ---------------------------------------------------------------------------
+# Create output directories
+# ---------------------------------------------------------------------------
+CA_DIR="${BASE_PATH}/${LOCUS}_cutadapt"
+BBD_DIR="${BASE_PATH}/${LOCUS}_bbduk"
+MERGED_DIR="${BASE_PATH}/${LOCUS}_merged"
+HIST_DIR="${BASE_PATH}/${LOCUS}_merge_hist"
+CMD_DIR="${BASE_PATH}/commands"
+LOG_DIR="${BASE_PATH}/logs"
+
+mkdir -p "${CA_DIR}" "${BBD_DIR}" "${MERGED_DIR}" "${HIST_DIR}" \
+         "${CMD_DIR}" "${LOG_DIR}"
+
+CA_CMDS="${CMD_DIR}/cutadapt_${LOCUS}.cmds"
+BBD_CMDS="${CMD_DIR}/bbduk_${LOCUS}.cmds"
+BBM_CMDS="${CMD_DIR}/bbmerge_${LOCUS}.cmds"
+> "${CA_CMDS}"
+> "${BBD_CMDS}"
+> "${BBM_CMDS}"
+
+CA_TSV="${BASE_PATH}/cutadapt_${LOCUS}_summary.tsv"
+BBD_TSV="${BASE_PATH}/bbduk_${LOCUS}_summary.tsv"
+BBM_TSV="${BASE_PATH}/bbmerge_${LOCUS}_summary.tsv"
+
+RC_REV=$(rc "${REV_SEQ}")
+RC_FWD=$(rc "${FWD_SEQ}")
+
+# ---------------------------------------------------------------------------
+# Stage 1 — cutadapt
+# ---------------------------------------------------------------------------
+echo ""
+echo "======================================================================"
+echo "STAGE 1 — cutadapt  (${LOCUS})"
+echo "  error rate : ${CA_ERROR_RATE}"
+echo "  min overlap: ${CA_OVERLAP} bp"
+echo "======================================================================"
+
+WILDCARD_FLAG=""
+[[ "${WILDCARD}" == "1" ]] && WILDCARD_FLAG="--match-read-wildcards"
+
+echo -e "Sample\tInput_Pairs\tPairs_Written\tPct_Written" > "${CA_TSV}"
+
+for sample in "${SAMPLES[@]}"; do
+    echo ""
+    echo "--- cutadapt | ${sample} | ${LOCUS} ---"
+
+    IN_R1="${IN_PATH}/${sample}${READ_FMT_R1}"
+    IN_R2="${IN_PATH}/${sample}${READ_FMT_R2}"
+    OUT_R1="${CA_DIR}/${sample}_R1.fq.gz"
+    OUT_R2="${CA_DIR}/${sample}_R2.fq.gz"
+    JSON="${CA_DIR}/${sample}_cutadapt.json"
+
+    # Skip if raw files are missing (warn rather than abort the whole job)
+    if [[ ! -f "${IN_R1}" || ! -f "${IN_R2}" ]]; then
+        echo "  WARNING: raw files not found, skipping ${sample}"
+        echo "    R1: ${IN_R1}"
+        echo "    R2: ${IN_R2}"
+        echo -e "${sample}\tNA\tNA\tNA" >> "${CA_TSV}"
+        # Write empty output files so downstream stages skip cleanly
+        echo -n | gzip > "${OUT_R1}"
+        echo -n | gzip > "${OUT_R2}"
+        continue
+    fi
+
+    cmd="cutadapt \
+        -e ${CA_ERROR_RATE} \
+        --overlap ${CA_OVERLAP} \
+        --minimum-length 50 \
+        --discard-untrimmed \
+        -n 2 \
+        -g ^${FWD_SEQ} \
+        -a ${RC_REV} \
+        -G ^${REV_SEQ} \
+        -A ${RC_FWD} \
+        -o ${OUT_R1} \
+        -p ${OUT_R2} \
+        --json=${JSON} \
+        -j ${THREADS} \
+        ${WILDCARD_FLAG} \
+        ${IN_R1} ${IN_R2}"
+
+    echo "${cmd}" >> "${CA_CMDS}"
+    eval "${cmd}" 2>&1 | tee -a "${LOG_DIR}/cutadapt_${LOCUS}_${sample}.log"
+
+    if [[ -f "${JSON}" ]]; then
+        python3 - "${JSON}" "${sample}" "${CA_TSV}" <<'PYEOF'
+import sys, json
+json_path, sample, tsv = sys.argv[1], sys.argv[2], sys.argv[3]
+with open(json_path) as f:
+    d = json.load(f)
+rc = d["read_counts"]
+inp, out = rc["input"], rc["output"]
+pct = f"{out/inp*100:.1f}" if inp else "0.0"
+with open(tsv, "a") as f:
+    f.write(f"{sample}\t{inp}\t{out}\t{pct}\n")
+print(f"  >> {inp:,} in → {out:,} written ({pct}%)")
+PYEOF
+    fi
+done
+
+# ---------------------------------------------------------------------------
+# Stage 2 — bbduk
+# Empty cutadapt outputs (blanks/controls with no primer match) are skipped
+# rather than passed to bbduk, which exits non-zero on empty input and would
+# otherwise kill the entire job via set -e.
+# ---------------------------------------------------------------------------
+echo ""
+echo "======================================================================"
+echo "STAGE 2 — bbduk  (${LOCUS})"
+echo "======================================================================"
+
+echo -e "Sample\tInput_Reads\tResult_Reads\tPct_Remaining" > "${BBD_TSV}"
+
+for sample in "${SAMPLES[@]}"; do
+    echo ""
+    echo "--- bbduk | ${sample} | ${LOCUS} ---"
+
+    IN_R1="${CA_DIR}/${sample}_R1.fq.gz"
+    IN_R2="${CA_DIR}/${sample}_R2.fq.gz"
+    OUT_R1="${BBD_DIR}/${sample}_R1.fq.gz"
+    OUT_R2="${BBD_DIR}/${sample}_R2.fq.gz"
+
+    # Check read count — skip rather than pass empty files to bbduk
+    n_pairs=$(count_pairs "${IN_R1}")
+    if [[ "${n_pairs}" -eq 0 ]]; then
+        echo "  >> 0 pairs from cutadapt — skipping bbduk for ${sample}"
+        echo -e "${sample}\t0\t0\t0.0" >> "${BBD_TSV}"
+        # Write empty outputs so bbmerge can also skip cleanly
+        echo -n | gzip > "${OUT_R1}"
+        echo -n | gzip > "${OUT_R2}"
+        continue
+    fi
+
+    cmd="${BBMAP_DIR}/bbduk.sh \
+        in1=${IN_R1} in2=${IN_R2} \
+        out1=${OUT_R1} out2=${OUT_R2} \
+        minlen=80 ktrim=r k=23 mink=8 hdist=1 tbo tpe \
+        ref=${BBMAP_DIR}/resources/adapters.fa \
+        maxns=0 qtrim=r trimq=10 interleaved=f \
+        threads=${THREADS}"
+
+    echo "${cmd}" >> "${BBD_CMDS}"
+    logfile="${LOG_DIR}/bbduk_${LOCUS}_${sample}.log"
+    eval "${cmd}" 2>&1 | tee "${logfile}"
+
+    inp=$(grep -oP '^Input:\s+\K[0-9]+(?=\s+reads)' "${logfile}" | head -1 || true)
+    out=$(grep -oP '^Result:\s+\K[0-9]+(?=\s+reads)' "${logfile}" | head -1 || true)
+    pct=$(grep -oP '^Result:.*\(\K[\d.]+(?=%)' "${logfile}" | head -1 || true)
+    echo -e "${sample}\t${inp:-NA}\t${out:-NA}\t${pct:-NA}" >> "${BBD_TSV}"
+    echo "  >> ${inp:-NA} in → ${out:-NA} remaining (${pct:-NA}%)"
+done
+
+# ---------------------------------------------------------------------------
+# Stage 3 — bbmerge
+# Same empty-file guard as bbduk.
+# ---------------------------------------------------------------------------
+echo ""
+echo "======================================================================"
+echo "STAGE 3 — bbmerge  (${LOCUS})"
+echo "======================================================================"
+
+echo -e "Sample\tPairs\tJoined\tPct_Joined" > "${BBM_TSV}"
+
+for sample in "${SAMPLES[@]}"; do
+    echo ""
+    echo "--- bbmerge | ${sample} | ${LOCUS} ---"
+
+    IN_R1="${BBD_DIR}/${sample}_R1.fq.gz"
+    IN_R2="${BBD_DIR}/${sample}_R2.fq.gz"
+    MERGED="${MERGED_DIR}/${sample}_merged.fq.gz"
+    UNM_R1="${MERGED_DIR}/${sample}_unmerged_R1.fq.gz"
+    UNM_R2="${MERGED_DIR}/${sample}_unmerged_R2.fq.gz"
+    HIST="${HIST_DIR}/${sample}.hist"
+
+    n_pairs=$(count_pairs "${IN_R1}")
+    if [[ "${n_pairs}" -eq 0 ]]; then
+        echo "  >> 0 pairs from bbduk — skipping bbmerge for ${sample}"
+        echo -e "${sample}\t0\t0\t0.0" >> "${BBM_TSV}"
+        continue
+    fi
+
+    cmd="${BBMAP_DIR}/bbmerge.sh \
+        in1=${IN_R1} in2=${IN_R2} \
+        out=${MERGED} \
+        outu1=${UNM_R1} outu2=${UNM_R2} \
+        hist=${HIST} \
+        threads=${THREADS}"
+
+    echo "${cmd}" >> "${BBM_CMDS}"
+    logfile="${LOG_DIR}/bbmerge_${LOCUS}_${sample}.log"
+    eval "${cmd}" 2>&1 | tee "${logfile}"
+
+    pairs=$(grep -oP '^Pairs:\s+\K[0-9]+'  "${logfile}" | head -1 || true)
+    joined=$(grep -oP '^Joined:\s+\K[0-9]+' "${logfile}" | head -1 || true)
+    pct=$(grep -oP '^Joined:\s+[0-9]+\s+\K[\d.]+(?=%)' "${logfile}" | head -1 || true)
+    [[ -z "${pct}" ]] && pct="0.0"
+    echo -e "${sample}\t${pairs:-NA}\t${joined:-NA}\t${pct}" >> "${BBM_TSV}"
+    echo "  >> ${pairs:-NA} pairs → ${joined:-NA} merged (${pct}%)"
+done
+
+echo ""
+echo "======================================================================"
+echo "[$(date)] Done — ${LOCUS}"
+echo "  cutadapt error rate: ${CA_ERROR_RATE}  min overlap: ${CA_OVERLAP} bp"
+echo "  cutadapt summary : ${CA_TSV}"
+echo "  bbduk summary    : ${BBD_TSV}"
+echo "  bbmerge summary  : ${BBM_TSV}"
+echo "  command logs     : ${CMD_DIR}/"
+echo "  per-tool logs    : ${LOG_DIR}/"
+echo "======================================================================"
